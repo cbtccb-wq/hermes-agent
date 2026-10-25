@@ -241,7 +241,11 @@ def _vbs_identity(script: str) -> tuple[str, list[str]]:
     lines = script.splitlines()
     if len(lines) < 16 or not lines[0].startswith("' "):
         _unverified()
-    fixed = ["Option Explicit", "Dim sh, env, existing_pp",
+    # A tracked launcher waits for Python and propagates its exit code so Task
+    # Scheduler can apply RestartOnFailure. Accept only this complete variant.
+    tracked = lines[2] == "Dim sh, env, existing_pp, exit_code"
+    declaration = "Dim sh, env, existing_pp, exit_code" if tracked else "Dim sh, env, existing_pp"
+    fixed = ["Option Explicit", declaration,
              'Set sh = CreateObject("WScript.Shell")', 'Set env = sh.Environment("PROCESS")']
     if lines[1:5] != fixed:
         _unverified()
@@ -256,13 +260,16 @@ def _vbs_identity(script: str) -> tuple[str, list[str]]:
         env[match[1]] = match[2][1:-1].replace('""', '"')
         index += 1
     tail = lines[index:]
-    if len(tail) != 8 or tail[:2] != ['existing_pp = env.Item("PYTHONPATH")', 'If Len(existing_pp) > 0 Then'] or tail[3] != 'Else' or tail[5] != 'End If':
+    if len(tail) != (9 if tracked else 8) or tail[:2] != ['existing_pp = env.Item("PYTHONPATH")', 'If Len(existing_pp) > 0 Then'] or tail[3] != 'Else' or tail[5] != 'End If':
         _unverified()
     if not re.fullmatch(r'  env.Item\("PYTHONPATH"\) = ' + literal + r' & existing_pp', tail[2]) or not re.fullmatch(r'  env.Item\("PYTHONPATH"\) = ' + literal, tail[4]):
         _unverified()
     if not re.fullmatch(r'sh.CurrentDirectory = ' + literal, tail[6]):
         _unverified()
-    run = re.fullmatch(r'sh.Run (' + literal + r'), 0, False', tail[7])
+    if tracked and tail[8] != 'WScript.Quit exit_code':
+        _unverified()
+    run_pattern = r'exit_code = sh.Run\((' + literal + r'), 0, True\)' if tracked else r'sh.Run (' + literal + r'), 0, False'
+    run = re.fullmatch(run_pattern, tail[7])
     if not run or not env.get("HERMES_SUPERVISED_CHILD"):
         _unverified()
     command = run[1][1:-1].replace('""', '"')
@@ -291,9 +298,10 @@ def verify_windows_task(xml: str | bytes, home: Path, account: str, sid: str) ->
         _unverified()
     if user.casefold() not in {account.casefold(), sid.casefold()}:
         raise ValueError("service_account_mismatch")
-    if principal.findtext("t:RunLevel", "", ns) != "LeastPrivilege" or actions.get("Context") != principal.get("id"):
+    # Task Scheduler omits these elements when their values are the Windows defaults.
+    if principal.findtext("t:RunLevel", "LeastPrivilege", ns) != "LeastPrivilege" or actions.get("Context") != principal.get("id"):
         _unverified()
-    if task.findtext("t:Settings/t:Enabled", "", ns) != "true":
+    if task.findtext("t:Settings/t:Enabled", "true", ns) != "true":
         raise ValueError("service_disabled")
     action = actions[0]
     if action.tag != '{' + ns['t'] + '}Exec' or action.findtext('t:Command', '', ns).lower() not in {"wscript.exe", r"c:\windows\system32\wscript.exe"}:
